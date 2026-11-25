@@ -249,7 +249,9 @@ export const DonatePage: React.FC<DonatePageProps> = ({ onNavigate, initialCause
         if (!res.ok || !data.success || !data.url) {
           setError(
             data.error ||
-              'Could not start Stripe Checkout. Please verify your server configuration.'
+              (res.status === 404
+                ? 'Stripe Checkout endpoint (/api/create-checkout-session) returned 404. Ensure the api/ functions are deployed.'
+                : `Could not start Stripe Checkout (HTTP ${res.status}). Please verify STRIPE_SECRET_KEY in your server environment variables.`)
           );
           setSubmitting(false);
           return;
