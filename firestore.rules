@@ -1,0 +1,416 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// This security rules file assumes the following data structures:
+//
+// 1. Collection: users
+//    Document ID: {userId} (Must match request.auth.uid)
+//    Fields:
+//      - id: string (required, immutable, matches auth.uid)
+//      - name: string (required, 1-100 chars)
+//      - email: string (required, valid email pattern, max 150 chars)
+//      - role: string (required, 'volunteer' | 'organizer' | 'both' | 'admin')
+//      - bio: string (optional, max 1000 chars)
+//      - skills: list of strings (optional, max 30 items)
+//      - location: string (optional, max 150 chars)
+//      - phone: string (optional, max 30 chars)
+//      - organizationName: string (optional, max 150 chars)
+//      - avatar: string (optional, max 500 chars)
+//      - joinedDate: string (optional, max 50 chars)
+//      - badges: list of strings (optional, max 20 items, admin/system managed)
+//      - hoursLogged: number (optional, >= 0, admin/system managed)
+//      - createdAt: string or timestamp (optional, immutable)
+//      - updatedAt: string or timestamp (optional)
+//
+// 2. Collection: opportunities
+//    Document ID: {opportunityId}
+//    Fields:
+//      - id: string (required, 1-100 chars, immutable)
+//      - title: string (required, 1-150 chars)
+//      - organization: string (required, 1-150 chars)
+//      - organizationLogo: string (optional, max 500 chars)
+//      - organizerId: string (required, matches request.auth.uid on create, immutable)
+//      - organizerName: string (required, 1-100 chars)
+//      - organizerEmail: string (required, valid email pattern, max 150 chars)
+//      - organizerType: string (required, 'Nonprofit' | 'Community Group' | 'Individual in Need' | 'School' | 'Healthcare')
+//      - cause: string (required, one of 10 standard categories)
+//      - description: string (required, 1-3000 chars)
+//      - responsibilities: list of strings (required, max 30 items)
+//      - requirements: list of strings (required, max 30 items)
+//      - perks: list of strings (optional, max 20 items)
+//      - locationType: string (required, 'in-person' | 'remote' | 'hybrid')
+//      - address: string (optional, max 200 chars)
+//      - city: string (required, 1-100 chars)
+//      - state: string (required, 1-100 chars)
+//      - country: string (required, 1-100 chars)
+//      - isUrgent: bool (required)
+//      - startDate: string (required, 1-50 chars)
+//      - endDate: string (optional, max 50 chars)
+//      - commitmentHours: string (required, 1-100 chars)
+//      - spotsNeeded: int (required, > 0, <= 10000)
+//      - spotsFilled: int (required, >= 0, <= spotsNeeded)
+//      - skillsNeeded: list of strings (required, max 30 items)
+//      - bannerImage: string (required, max 500 chars)
+//      - createdAt: string or timestamp (required, immutable)
+//      - updatedAt: string or timestamp (optional)
+//      - status: string (required, 'open' | 'closed' | 'in-progress')
+//      - contactPhone: string (optional, max 30 chars)
+//
+// 3. Collection: applications
+//    Document ID: {applicationId}
+//    Fields:
+//      - id: string (required, 1-100 chars, immutable)
+//      - opportunityId: string (required, immutable, references existing opportunity)
+//      - opportunityTitle: string (required, 1-150 chars)
+//      - opportunityLocation: string (required, 1-150 chars)
+//      - organizationName: string (required, 1-150 chars)
+//      - applicantId: string (required, matches auth.uid on create, immutable)
+//      - applicantName: string (required, 1-100 chars)
+//      - applicantEmail: string (required, valid email pattern, max 150 chars)
+//      - applicantPhone: string (required, 1-30 chars)
+//      - applicantAvatar: string (optional, max 500 chars)
+//      - coverNote: string (required, 1-2000 chars)
+//      - availableDays: list of strings (required, max 10 items)
+//      - skillsOffered: list of strings (required, max 30 items)
+//      - status: string (required, 'pending' | 'accepted' | 'declined')
+//      - appliedAt: string or timestamp (required, immutable)
+//      - updatedAt: string or timestamp (optional)
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Default Deny Root
+    // ===============================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    // Check if the user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Check if user is owner of a user profile document
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Check if user is platform administrator via custom claim or verified bootstrap email
+    function isAdmin() {
+      return isAuthenticated() && (
+        ('admin' in request.auth.token && request.auth.token.admin == true) ||
+        ('email' in request.auth.token && request.auth.token.email in ['admin@giveback.org', 'support@giveback.org'])
+      );
+    }
+
+    // Validate email format
+    function isValidEmail(email) {
+      return email is string &&
+        email.size() <= 150 &&
+        email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    // Validate string length bounds
+    function validString(field, minLen, maxLen) {
+      return field in request.resource.data &&
+        request.resource.data[field] is string &&
+        request.resource.data[field].size() >= minLen &&
+        request.resource.data[field].size() <= maxLen;
+    }
+
+    // Validate optional string (if present, must be string and within bounds)
+    function validOptionalString(field, minLen, maxLen) {
+      return !(field in request.resource.data) ||
+        (request.resource.data[field] is string &&
+         request.resource.data[field].size() >= minLen &&
+         request.resource.data[field].size() <= maxLen);
+    }
+
+    // Validate date / timestamp representation (ISO string or timestamp)
+    function validDateField(field) {
+      return !(field in request.resource.data) ||
+        (request.resource.data[field] is timestamp) ||
+        (request.resource.data[field] is string &&
+         request.resource.data[field].size() >= 4 &&
+         request.resource.data[field].size() <= 50);
+    }
+
+    // Validate list bounds
+    function validList(field, minSize, maxSize) {
+      return field in request.resource.data &&
+        request.resource.data[field] is list &&
+        request.resource.data[field].size() >= minSize &&
+        request.resource.data[field].size() <= maxSize;
+    }
+
+    // Validate optional list bounds
+    function validOptionalList(field, maxSize) {
+      return !(field in request.resource.data) ||
+        (request.resource.data[field] is list &&
+         request.resource.data[field].size() <= maxSize);
+    }
+
+    // Verify fields that cannot change during an update
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Check if the current user is the organizer of a given opportunity
+    function isOpportunityOrganizer(opportunityId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/opportunities/$(opportunityId)) &&
+        get(/databases/$(database)/documents/opportunities/$(opportunityId)).data.organizerId == request.auth.uid;
+    }
+
+    // ===============================================================
+    // Domain Validators (Enforced on BOTH create and update)
+    // ===============================================================
+
+    // 1. User Domain Validator
+    function isValidUser(data) {
+      return data.keys().hasOnly([
+          'id', 'name', 'email', 'avatar', 'role', 'bio', 'location',
+          'phone', 'organizationName', 'joinedDate', 'badges',
+          'hoursLogged', 'skills', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasAll(['id', 'name', 'email']) &&
+        validString('id', 1, 100) &&
+        validString('name', 1, 100) &&
+        isValidEmail(data.email) &&
+        (!( 'role' in data ) || data.role in ['volunteer', 'organizer', 'both', 'admin']) &&
+        validOptionalString('avatar', 0, 500) &&
+        validOptionalString('bio', 0, 1000) &&
+        validOptionalString('location', 0, 150) &&
+        validOptionalString('phone', 0, 30) &&
+        validOptionalString('organizationName', 0, 150) &&
+        validOptionalString('joinedDate', 0, 50) &&
+        validOptionalList('badges', 20) &&
+        validOptionalList('skills', 30) &&
+        (!( 'hoursLogged' in data ) || (data.hoursLogged is number && data.hoursLogged >= 0 && data.hoursLogged <= 100000)) &&
+        validDateField('createdAt') &&
+        validDateField('updatedAt');
+    }
+
+    // 2. Opportunity Domain Validator
+    function isValidOpportunity(data) {
+      return data.keys().hasOnly([
+          'id', 'title', 'organization', 'organizationLogo', 'organizerId',
+          'organizerName', 'organizerEmail', 'organizerType', 'cause',
+          'description', 'responsibilities', 'requirements', 'perks',
+          'locationType', 'address', 'city', 'state', 'country', 'isUrgent',
+          'startDate', 'endDate', 'commitmentHours', 'spotsNeeded',
+          'spotsFilled', 'skillsNeeded', 'bannerImage', 'createdAt',
+          'updatedAt', 'status', 'contactPhone'
+        ]) &&
+        data.keys().hasAll([
+          'id', 'title', 'organization', 'organizerId', 'organizerName',
+          'organizerEmail', 'organizerType', 'cause', 'description',
+          'responsibilities', 'requirements', 'locationType', 'city',
+          'state', 'country', 'isUrgent', 'startDate', 'commitmentHours',
+          'spotsNeeded', 'spotsFilled', 'skillsNeeded', 'bannerImage',
+          'createdAt', 'status'
+        ]) &&
+        validString('id', 1, 100) &&
+        validString('title', 1, 150) &&
+        validString('organization', 1, 150) &&
+        validOptionalString('organizationLogo', 0, 500) &&
+        validString('organizerId', 1, 100) &&
+        validString('organizerName', 1, 100) &&
+        isValidEmail(data.organizerEmail) &&
+        data.organizerType in ['Nonprofit', 'Community Group', 'Individual in Need', 'School', 'Healthcare'] &&
+        data.cause in [
+          'Community & Social', 'Animals & Wildlife', 'Education & Tutoring',
+          'Environment & Nature', 'Hunger & Food Relief', 'Health & Wellness',
+          'Disaster & Crisis Aid', 'Elderly & Senior Care', 'Arts & Culture',
+          'Technology & Digital Aid'
+        ] &&
+        validString('description', 1, 3000) &&
+        validList('responsibilities', 1, 30) &&
+        validList('requirements', 1, 30) &&
+        validOptionalList('perks', 20) &&
+        data.locationType in ['in-person', 'remote', 'hybrid'] &&
+        validOptionalString('address', 0, 200) &&
+        validString('city', 1, 100) &&
+        validString('state', 1, 100) &&
+        validString('country', 1, 100) &&
+        data.isUrgent is bool &&
+        validString('startDate', 1, 50) &&
+        validOptionalString('endDate', 0, 50) &&
+        validString('commitmentHours', 1, 100) &&
+        data.spotsNeeded is int && data.spotsNeeded > 0 && data.spotsNeeded <= 10000 &&
+        data.spotsFilled is int && data.spotsFilled >= 0 && data.spotsFilled <= data.spotsNeeded &&
+        validList('skillsNeeded', 1, 30) &&
+        validString('bannerImage', 1, 500) &&
+        data.status in ['open', 'closed', 'in-progress'] &&
+        validOptionalString('contactPhone', 0, 30) &&
+        validDateField('createdAt') &&
+        validDateField('updatedAt');
+    }
+
+    // 3. Application Domain Validator
+    function isValidApplication(data) {
+      return data.keys().hasOnly([
+          'id', 'opportunityId', 'opportunityTitle', 'opportunityLocation',
+          'organizationName', 'applicantId', 'applicantName', 'applicantEmail',
+          'applicantPhone', 'applicantAvatar', 'coverNote', 'availableDays',
+          'skillsOffered', 'status', 'appliedAt', 'updatedAt'
+        ]) &&
+        data.keys().hasAll([
+          'id', 'opportunityId', 'opportunityTitle', 'opportunityLocation',
+          'organizationName', 'applicantId', 'applicantName', 'applicantEmail',
+          'applicantPhone', 'coverNote', 'availableDays', 'skillsOffered',
+          'status', 'appliedAt'
+        ]) &&
+        validString('id', 1, 100) &&
+        validString('opportunityId', 1, 100) &&
+        validString('opportunityTitle', 1, 150) &&
+        validString('opportunityLocation', 1, 150) &&
+        validString('organizationName', 1, 150) &&
+        validString('applicantId', 1, 100) &&
+        validString('applicantName', 1, 100) &&
+        isValidEmail(data.applicantEmail) &&
+        validString('applicantPhone', 1, 30) &&
+        validOptionalString('applicantAvatar', 0, 500) &&
+        validString('coverNote', 1, 2000) &&
+        validList('availableDays', 1, 10) &&
+        validList('skillsOffered', 0, 30) &&
+        data.status in ['pending', 'accepted', 'declined'] &&
+        validDateField('appliedAt') &&
+        validDateField('updatedAt');
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // ---------------------------------------------------------------
+    // 1. Users Collection
+    // ---------------------------------------------------------------
+    match /users/{userId} {
+      // PII Protection: Strictly owner or platform admin can read user profile
+      allow read: if isOwner(userId) || isAdmin();
+
+      // Create: Authenticated user can create their own profile; cannot self-assign admin role
+      allow create: if isAuthenticated() &&
+        request.auth.uid == userId &&
+        request.resource.data.id == userId &&
+        isValidUser(request.resource.data) &&
+        (!('role' in request.resource.data) || request.resource.data.role in ['volunteer', 'organizer', 'both'] || isAdmin()) &&
+        (!('hoursLogged' in request.resource.data) || request.resource.data.hoursLogged == 0 || isAdmin()) &&
+        (!('badges' in request.resource.data) || request.resource.data.badges.size() <= 2 || isAdmin());
+
+      // Update: User can update own profile; ID is immutable; role cannot be escalated to admin;
+      // badges and hoursLogged cannot be self-awarded without admin privileges
+      allow update: if isAuthenticated() &&
+        (isOwner(userId) || isAdmin()) &&
+        isValidUser(request.resource.data) &&
+        request.resource.data.id == resource.data.id &&
+        (isAdmin() || (
+          // Role cannot be changed to admin by regular users
+          (request.resource.data.role == resource.data.role ||
+           (resource.data.role != 'admin' && request.resource.data.role in ['volunteer', 'organizer', 'both'])) &&
+          // Badges and hoursLogged cannot be modified by regular users
+          areImmutableFieldsUnchanged(['badges', 'hoursLogged'])
+        ));
+
+      // Delete: Only user or admin can delete their account profile
+      allow delete: if isOwner(userId) || isAdmin();
+    }
+
+    // ---------------------------------------------------------------
+    // 2. Opportunities Collection
+    // ---------------------------------------------------------------
+    match /opportunities/{opportunityId} {
+      // Read: Authenticated users can browse all volunteer opportunities & requests
+      allow read: if isAuthenticated();
+
+      // Create: Authenticated user creates an opportunity they own
+      allow create: if isAuthenticated() &&
+        request.resource.data.organizerId == request.auth.uid &&
+        request.resource.data.spotsFilled == 0 &&
+        isValidOpportunity(request.resource.data);
+
+      // Update:
+      // A) Organizer or Admin can edit opportunity content (organizerId, id, createdAt immutable)
+      // B) Authenticated volunteer can atomically increment spotsFilled when applying
+      allow update: if isAuthenticated() &&
+        isValidOpportunity(request.resource.data) &&
+        request.resource.data.id == resource.data.id &&
+        request.resource.data.organizerId == resource.data.organizerId &&
+        areImmutableFieldsUnchanged(['createdAt']) &&
+        (
+          // Full organizer / admin update
+          (request.auth.uid == resource.data.organizerId || isAdmin()) ||
+          // Spot increment upon volunteer application
+          (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['spotsFilled', 'updatedAt']) &&
+            request.resource.data.spotsFilled == resource.data.spotsFilled + 1 &&
+            request.resource.data.spotsFilled <= resource.data.spotsNeeded
+          )
+        );
+
+      // Delete: Only opportunity organizer or admin can remove an opportunity
+      allow delete: if isAuthenticated() &&
+        (request.auth.uid == resource.data.organizerId || isAdmin());
+    }
+
+    // ---------------------------------------------------------------
+    // 3. Applications Collection
+    // ---------------------------------------------------------------
+    match /applications/{applicationId} {
+      // Read: Applicant, the opportunity organizer, or platform admin can read the application
+      allow read: if isAuthenticated() && (
+        request.auth.uid == resource.data.applicantId ||
+        isOpportunityOrganizer(resource.data.opportunityId) ||
+        isAdmin()
+      );
+
+      // Create: Authenticated applicant can apply; initial status must be pending;
+      // target opportunity must exist
+      allow create: if isAuthenticated() &&
+        request.auth.uid == request.resource.data.applicantId &&
+        request.resource.data.status == 'pending' &&
+        exists(/databases/$(database)/documents/opportunities/$(request.resource.data.opportunityId)) &&
+        isValidApplication(request.resource.data);
+
+      // Update:
+      // A) Opportunity organizer or admin can update application status (accepted / declined)
+      // B) Applicant can edit their application details while pending, but cannot approve themselves
+      allow update: if isAuthenticated() &&
+        isValidApplication(request.resource.data) &&
+        request.resource.data.id == resource.data.id &&
+        request.resource.data.opportunityId == resource.data.opportunityId &&
+        request.resource.data.applicantId == resource.data.applicantId &&
+        areImmutableFieldsUnchanged(['appliedAt']) &&
+        (
+          // Organizer/Admin can update status
+          (
+            (isOpportunityOrganizer(resource.data.opportunityId) || isAdmin()) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+          ) ||
+          // Applicant can update application details while pending
+          (
+            request.auth.uid == resource.data.applicantId &&
+            resource.data.status == 'pending' &&
+            request.resource.data.status == 'pending'
+          )
+        );
+
+      // Delete: Applicant or admin can withdraw / delete the application
+      allow delete: if isAuthenticated() && (
+        request.auth.uid == resource.data.applicantId ||
+        isAdmin()
+      );
+    }
+  }
+}
